@@ -117,8 +117,35 @@ jobs:
 
       - name: 更新/安装 Feeds
         run: |
+          # 5G 模组支持 feed（Siriling/5G-Modem-Support）：
+          # 提供 LuCI 管理界面（luci-app-modem / cpe / sms-tool）、AT 工具（sendat）、
+          # 短信工具（sms-tool）和拨号客户端（quectel-cm）。
+          grep -q "modem5g" feeds.conf.default || \
+            echo "src-git modem5g https://github.com/Siriling/5G-Modem-Support.git;main" >> feeds.conf.default
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
+          # ---- 5G feed 依赖裁剪（不改就等于白编）----
+          # 1) luci-app-modem 依赖 kmod-pcie_mhi（PCIe 版 MHI 驱动）：本机是 USB 模组，
+          #    该驱动要 PCIe 端点，编出来也用不上，反而可能因 6.12 内核 API 变化编失败。
+          # 2) luci-app-modem 依赖 ndisc6/rdisc6：本 feed 的 ndisc 包源站
+          #    www.remlab.net 已返回 410 Gone，下载必然失败（IPv6 邻居发现，非必需）。
+          # 3) luci-app-usbmodem 依赖 kmod-qmi_wwan_q / qmi_wwan_f（厂商定制 qmi_wwan）：
+          #    RNDIS 模式用不到，且需给内核打补丁，改用内核自带 kmod-usb-net-qmi-wwan。
+          # 4) luci-app-cpe 的 Makefile 写成 "+ luci-compat"（多一个空格），
+          #    make 会把它拆成空依赖，导致 luci-compat 不被选中。
+          MF=feeds/modem5g
+          sed -i 's/+kmod-pcie_mhi//; s/+ndisc6 +rdisc6//' "$MF/luci-app-modem/Makefile"
+          sed -i 's/+kmod-qmi_wwan_f +kmod-qmi_wwan_q//'   "$MF/luci-app-usbmodem/Makefile"
+          sed -i 's/+kmod-pcie_mhi//'                       "$MF/luci-app-hypermodem/Makefile"
+          sed -i 's/+ luci-compat/+luci-compat/'            "$MF/luci-app-cpe/Makefile"
+          echo "::group::5G feed 包清单"
+          for p in luci-app-modem luci-app-cpe luci-app-sms-tool sendat sms-tool quectel-cm; do
+            ls -d "$MF/$p" >/dev/null 2>&1 && echo "  ok   $p" || echo "  MISSING $p"
+          done
+          echo "::endgroup::"
+          grep -nE "^[[:space:]]*(LUCI_)?DEPENDS" -A12 "$MF/luci-app-modem/Makefile" | head -20
+
           echo "::group::store feed（iStore 应用商店本体）是否已注册"
           ./scripts/feeds list -n 2>/dev/null | grep -E '^(luci-app-store|taskd|luci-lib-taskd|luci-lib-xterm)$' || \
             echo "警告：store feed 中的包未列出"
@@ -314,6 +341,64 @@ jobs:
           CONFIG_PACKAGE_kmod-nf-socket=y
           CONFIG_PACKAGE_kmod-nf-tproxy=y
           CONFIG_PACKAGE_yq=y
+          # ===============================================================
+          # L. USB 网卡 / 5G 模块驱动（RNDIS 上网棒、USB 转串口 AT 口）
+          # 目标设备：SoyeaLink SY108（紫光展锐 UDX710，USB ID 1782:4038），
+          # RNDIS 模式下由 rndis_host 生成 usb0，路由器把 usb0 当 WAN 用。
+          # 这些 kmod 必须和内核同批编译：自定义内核哈希与官方源对不上，
+          # 装外部 apk 会失败，甚至写 overlay 时把机器写死。
+          #   kmod-usb-net             → usbnet.ko（底层框架）
+          #   kmod-usb-net-cdc-ether   → cdc_ether.ko（CDC ECM，部分 5G 棒用这个）
+          #   kmod-usb-net-rndis       → rndis_host.ko（本设备主用）
+          #   kmod-usb-serial          → usbserial.ko
+          #   kmod-usb-serial-wwan     → usb_wwan.ko
+          #   kmod-usb-serial-option   → option.ko（发 AT 命令切模式/查信号）
+          #   usbutils                 → lsusb，插棒时确认 1782:4038 是否被枚举
+          # ===============================================================
+          CONFIG_PACKAGE_kmod-usb-net=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ether=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-ncm=y
+          CONFIG_PACKAGE_kmod-usb-net-rndis=y
+          CONFIG_PACKAGE_kmod-usb-acm=y
+          CONFIG_PACKAGE_kmod-usb-serial=y
+          CONFIG_PACKAGE_kmod-usb-serial-wwan=y
+          CONFIG_PACKAGE_kmod-usb-serial-option=y
+          CONFIG_PACKAGE_usbutils=y
+          # ===============================================================
+          # M. 5G 模组管理插件（feed: Siriling/5G-Modem-Support）
+          # 目标：在 LuCI 里看信号/频段、发 AT、收发短信、控制拨号，不必再开 SSH。
+          #   luci-app-modem       → 主界面（1.4.4，模组信息/AT/短信/拨号/重启）
+          #   luci-app-cpe         → 轻量信息页（信号强度/网络状态/AT 窗口）
+          #   luci-app-sms-tool    → 短信收发界面
+          #   sendat / sms-tool    → 命令行 AT / 短信工具（界面后台调用）
+          #   quectel-cm           → 通用 QMI/MBIM 拨号客户端（RNDIS 模式不用，切模式时用）
+          # 注意：这些界面是 Lua 架构，25.12 的 LuCI 是 JS 架构，
+          # 必须有 luci-compat（前文 C 段已选）+ luci-lua-runtime 才能注册菜单。
+          # ===============================================================
+          CONFIG_PACKAGE_luci-lua-runtime=y
+          CONFIG_PACKAGE_luci-app-modem=y
+          CONFIG_PACKAGE_luci-app-cpe=y
+          CONFIG_PACKAGE_luci-app-sms-tool=y
+          CONFIG_PACKAGE_sendat=y
+          CONFIG_PACKAGE_sms-tool=y
+          CONFIG_PACKAGE_quectel-cm=y
+          # 上述界面的 kmod 依赖，逐项显式列出：
+          # OpenWrt 的 defconfig 对「依赖不满足」的包是静默丢弃，
+          # 只要链上少一环，整个界面就从固件里消失（上一版没有首页就是这个原因）。
+          CONFIG_PACKAGE_kmod-usb-net-qmi-wwan=y
+          CONFIG_PACKAGE_kmod-usb-wdm=y
+          CONFIG_PACKAGE_kmod-usb-net-cdc-mbim=y
+          CONFIG_PACKAGE_kmod-usb-net-sierrawireless=y
+          CONFIG_PACKAGE_kmod-usb-net-huawei-cdc-ncm=y
+          CONFIG_PACKAGE_kmod-usb-serial-qualcomm=y
+          CONFIG_PACKAGE_kmod-usb2=y
+          CONFIG_PACKAGE_kmod-usb3=y
+          CONFIG_PACKAGE_kmod-usb-ohci=y
+          CONFIG_PACKAGE_pciutils=y
+          CONFIG_PACKAGE_pciids=y
+          CONFIG_PACKAGE_bc=y
+          CONFIG_PACKAGE_jq=y
+          CONFIG_PACKAGE_luci-proto-qmi=y
           EOF
 
       - name: 展开默认配置并校验机型 (defconfig + verify)
@@ -389,10 +474,36 @@ jobs:
           kmod-nft-tproxy
           yq
           "
+          # 5G 上网棒驱动：缺一个就刷了也白刷（插棒不认、拿不到 usb0）
+          USB5G="
+          kmod-usb-net
+          kmod-usb-net-cdc-ether
+          kmod-usb-net-cdc-ncm
+          kmod-usb-net-rndis
+          kmod-usb-acm
+          kmod-usb-serial
+          kmod-usb-serial-wwan
+          kmod-usb-serial-option
+          usbutils
+          "
+          # 5G 管理插件：缺失不让构建立刻失败（驱动才是上网的关键），
+          # 但必须显式告警——否则又会出现「刷完发现界面没有」的情况。
+          MODEM5G="
+          luci-compat
+          luci-lua-runtime
+          luci-app-modem
+          luci-app-cpe
+          luci-app-sms-tool
+          sendat
+          sms-tool
+          quectel-cm
+          "
 
           : > /tmp/missing_hard
           : > /tmp/missing_nikki
           : > /tmp/missing_soft
+          : > /tmp/missing_usb5g
+          : > /tmp/missing_modem5g
 
           check_group() {
             label="$1"; file="$2"; shift 2
@@ -414,6 +525,8 @@ jobs:
           check_group "关键界面栈（缺失即失败）" /tmp/missing_hard $HARD
           check_group "可选增强组件（缺失仅警告）" /tmp/missing_soft $SOFT
           check_group "Nikki 依赖（缺失即失败）" /tmp/missing_nikki $NIKKI
+          check_group "5G 上网棒驱动（缺失即失败）" /tmp/missing_usb5g $USB5G
+          check_group "5G 管理插件（缺失仅警告）" /tmp/missing_modem5g $MODEM5G
 
           WARN_ONLY=$(tr '\n' ' ' < /tmp/missing_soft | sed 's/  */ /g;s/^ //;s/ $//')
           HARD_FAIL=$(tr '\n' ' ' < /tmp/missing_hard | sed 's/  */ /g;s/^ //;s/ $//')
@@ -438,8 +551,20 @@ jobs:
             exit 1
           fi
 
+          USB5G_FAIL=$(tr '\n' ' ' < /tmp/missing_usb5g | sed 's/  */ /g;s/^ //;s/ $//')
+          if [ -n "$USB5G_FAIL" ]; then
+            echo "::error::5G 上网棒驱动在 defconfig 后丢失，固件刷完插棒不会认（包名有误或依赖不满足）: $USB5G_FAIL"
+            exit 1
+          fi
+
+          MODEM5G_FAIL=$(tr '\n' ' ' < /tmp/missing_modem5g | sed 's/  */ /g;s/^ //;s/ $//')
+          if [ -n "$MODEM5G_FAIL" ]; then
+            echo "::warning::5G 管理插件未全部进入固件（不影响上网，只影响 LuCI 里的模组界面）: $MODEM5G_FAIL"
+          fi
+
           echo "关键界面栈全部就位，完整版界面可以成型"
           echo "Nikki 依赖全部就位（kmod-inet-diag / kmod-nft-socket / kmod-nft-tproxy / yq）"
+          echo "5G 上网棒驱动全部就位（usbnet / cdc_ether / cdc_ncm / rndis_host / cdc_acm / usb_wwan / option + lsusb）"
 
       - name: 预下载源码包 (make download)
         run: |
@@ -506,6 +631,27 @@ jobs:
             fi
           done
           echo "Nikki 依赖校验通过：kmod-inet-diag / kmod-nft-socket / kmod-nft-tproxy / yq 均已入固件"
+
+          # 5G 上网棒驱动必须齐全：这是本次定制的唯一目的，缺一个就发出去也是废固件
+          for pkg in kmod-usb-net kmod-usb-net-cdc-ether kmod-usb-net-cdc-ncm kmod-usb-net-rndis \
+                     kmod-usb-acm kmod-usb-serial kmod-usb-serial-wwan kmod-usb-serial-option usbutils; do
+            if ! grep -q "^${pkg} " "$MANIFEST"; then
+              echo "::error::manifest 中没有 ${pkg}，插 5G 棒不会生成 usb0，WAN 起不来"
+              exit 1
+            fi
+          done
+          echo "5G 驱动校验通过：usbnet / cdc_ether / rndis_host / usb_wwan / option / lsusb 均已入固件"
+
+          # 5G 管理插件：只告警，不阻断（驱动已保证能上网，界面是增强项）
+          echo "::group::5G 管理插件是否入固件"
+          for pkg in luci-app-modem luci-app-cpe luci-app-sms-tool sendat sms-tool quectel-cm luci-compat luci-lua-runtime; do
+            if grep -q "^${pkg} " "$MANIFEST"; then
+              echo "  ok      ${pkg}  $(grep "^${pkg} " "$MANIFEST" | head -1 | awk '{print $3}')"
+            else
+              echo "::warning::manifest 中没有 ${pkg}（LuCI 里不会有对应的模组界面）"
+            fi
+          done
+          echo "::endgroup::"
 
       - name: 校验服务自启 (Verify services are enabled at first boot)
         run: |
@@ -789,6 +935,10 @@ jobs:
             echo "- TUN/TAP 虚拟网卡（kmod-tun）：TUN 模式代理可直接使用"
             echo "- daed 底层内核支持（BTF / XDP / BPF），daed 本体刷机后自行安装"
             echo "- Nikki（Mihomo）透明代理依赖：kmod-inet-diag / kmod-nft-socket / kmod-nft-tproxy + yq"
+            echo "- USB 网卡 / 5G 上网棒驱动：kmod-usb-net + cdc-ether + cdc-ncm + rndis + acm + serial-wwan + serial-option，附 lsusb（usbutils）"
+            echo "  → RNDIS 上网棒（如 SoyeaLink SY108 / 展锐 UDX710，1782:4038）插上即出 usb0，可直配 WAN"
+            echo "- 5G 模组管理插件（Siriling/5G-Modem-Support）：luci-app-modem（信号/AT/短信/拨号）、luci-app-cpe（状态页）、luci-app-sms-tool（短信）、sendat、sms-tool、quectel-cm"
+            echo "  → LuCI 菜单：网络 → 模组（Modem）/ CPE / 短信；AT 口需 /dev/ttyUSB* 或 /dev/ttyACM*"
             echo
             echo "### 刷机"
             echo
