@@ -134,13 +134,19 @@ jobs:
           #    RNDIS 模式用不到，且需给内核打补丁，改用内核自带 kmod-usb-net-qmi-wwan。
           # 4) luci-app-cpe 的 Makefile 写成 "+ luci-compat"（多一个空格），
           #    make 会把它拆成空依赖，导致 luci-compat 不被选中。
+          # 5) quectel_cm_5G（即 quectel-cm 拨号客户端，luci-app-modem 依赖它）
+          #    锁定的 PKG_MIRROR_HASH 与 GitHub 仓库该 commit 当前产出的
+          #    源码包哈希不一致（上游仓库被重建过），下载必然哈希校验失败
+          #    → 整个编译卡死。置为 skip 跳过校验，改走 git clone 拉源码。
           MF=feeds/modem5g
           sed -i 's/+kmod-pcie_mhi//; s/+ndisc6 +rdisc6//' "$MF/luci-app-modem/Makefile"
           sed -i 's/+kmod-qmi_wwan_f +kmod-qmi_wwan_q//'   "$MF/luci-app-usbmodem/Makefile"
           sed -i 's/+kmod-pcie_mhi//'                       "$MF/luci-app-hypermodem/Makefile"
           sed -i 's/+ luci-compat/+luci-compat/'            "$MF/luci-app-cpe/Makefile"
+          sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' "$MF/quectel_cm_5G/Makefile"
+          grep -n "PKG_MIRROR_HASH" "$MF/quectel_cm_5G/Makefile"
           echo "::group::5G feed 包清单"
-          for p in luci-app-modem luci-app-cpe luci-app-sms-tool sendat sms-tool quectel-cm; do
+          for p in luci-app-modem luci-app-cpe luci-app-sms-tool sendat sms-tool quectel_cm_5G; do
             ls -d "$MF/$p" >/dev/null 2>&1 && echo "  ok   $p" || echo "  MISSING $p"
           done
           echo "::endgroup::"
