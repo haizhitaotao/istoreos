@@ -145,6 +145,13 @@ jobs:
           sed -i 's/+ luci-compat/+luci-compat/'            "$MF/luci-app-cpe/Makefile"
           sed -i 's/^PKG_MIRROR_HASH:=.*/PKG_MIRROR_HASH:=skip/' "$MF/quectel_cm_5G/Makefile"
           grep -n "PKG_MIRROR_HASH" "$MF/quectel_cm_5G/Makefile"
+          # 6) luci-app-modem 与 luci-app-cpe 都自带 /etc/config/modem 和
+          #    /etc/init.d/modem，apk 入库时不允许文件覆盖 → make package/install
+          #    报 "trying to overwrite ... owned by ..." 而失败（编译全绿也没用）。
+          #    保留 luci-app-modem 的版本（19KB 完整拨号守护，主管理界面），
+          #    删掉 luci-app-cpe 的两份重复文件（CPE 仅状态展示页，不受影响）。
+          rm -f "$MF/luci-app-cpe/root/etc/config/modem" \
+                "$MF/luci-app-cpe/root/etc/init.d/modem"
           echo "::group::5G feed 包清单"
           for p in luci-app-modem luci-app-cpe luci-app-sms-tool sendat sms-tool quectel_cm_5G; do
             ls -d "$MF/$p" >/dev/null 2>&1 && echo "  ok   $p" || echo "  MISSING $p"
